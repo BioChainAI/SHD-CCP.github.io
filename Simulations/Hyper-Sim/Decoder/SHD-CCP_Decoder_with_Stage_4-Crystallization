@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HyperSim: SHD-CCP Decoder (Crystallization Enabled)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Application Structure Plan:
+         Optimized SHD-CCP Decoder with Stage 4: Crystallization.
+         
+         UPDATES:
+         1. UI Behavior: The "S-Plane Offline" overlay has been removed. Toggling the scanner now simply pauses the visual animation and stops the background calculation loop.
+         2. Persistence: When paused, the last calculated data remains visible.
+         3. Status Indication: The scanner status text updates to "PAUSED (OPTIMIZING)" when the 720-step cycle is running.
+    -->
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* slate-900 */
+            color: #e2e8f0; /* slate-200 */
+        }
+        .font-mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+        .tab-button { transition: all 0.2s ease-in-out; border-bottom: 2px solid transparent; }
+        .tab-button.active { color: #38bdf8; border-bottom-color: #38bdf8; background: rgba(56, 189, 248, 0.1); }
+        
+        .panel {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .tile-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; }
+        .tile-bit { aspect-ratio: 1; background: #334155; border-radius: 2px; transition: background-color 0.2s; }
+        .tile-bit.active { background: #38bdf8; box-shadow: 0 0 4px #38bdf8; }
+        .tile-bit.halo { background: #10b981; }
+        .tile-bit.core { background: #3b82f6; }
+        .tile-bit.phys { background: #f59e0b; }
+
+        .scan-line {
+            height: 2px; background: #10b981; box-shadow: 0 0 8px #10b981;
+            animation: scan 2s linear infinite;
+        }
+        /* When paused, we stop the animation but keep it visible (frozen) or hidden if desired. 
+           Here we just pause it. */
+        .scan-line.paused {
+            animation-play-state: paused;
+            opacity: 0.5;
+        }
+        
+        @keyframes scan {
+            0% { top: 0%; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { top: 100%; opacity: 0; }
+        }
+        
+        /* Toggle Switch */
+        .toggle-checkbox:checked {
+            right: 0;
+            border-color: #10b981;
+        }
+        .toggle-checkbox:checked + .toggle-label {
+            background-color: #10b981;
+        }
+        
+        /* Codex Items */
+        .codex-item {
+            animation: fadeIn 0.5s ease-out;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+
+    <!-- Header -->
+    <header class="bg-slate-900 border-b border-slate-700 px-6 py-3 flex justify-between items-center shrink-0">
+        <div class="flex items-center space-x-3">
+            <div class="w-8 h-8 bg-sky-500 rounded flex items-center justify-center font-bold text-slate-900">H</div>
+            <div>
+                <h1 class="font-bold text-lg tracking-tight text-white">HyperSim <span class="text-sky-400">Control Panel</span></h1>
+                <p class="text-xs text-slate-400 font-mono">SHD-CCP v1.2 // LEARNING ENABLED</p>
+            </div>
+        </div>
+        <nav class="flex space-x-1 bg-slate-800 p-1 rounded-lg">
+            <button id="tab-console" class="tab-button active px-4 py-1.5 rounded-md text-sm font-medium text-slate-300 hover:text-white">Console</button>
+            <button id="tab-protocols" class="tab-button px-4 py-1.5 rounded-md text-sm font-medium text-slate-300 hover:text-white">Protocols</button>
+            <button id="tab-api" class="tab-button px-4 py-1.5 rounded-md text-sm font-medium text-slate-300 hover:text-white">API Bridge</button>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex overflow-hidden p-4 gap-4 relative">
+        
+        <!-- View: Console -->
+        <div id="view-console" class="flex w-full h-full gap-4 transition-opacity duration-300">
+            
+            <!-- Left: Composer -->
+            <div class="panel w-72 flex flex-col overflow-hidden flex-shrink-0">
+                <div class="p-4 border-b border-slate-700 bg-slate-800/50">
+                    <h2 class="font-bold text-sm text-sky-400 uppercase tracking-wider">Einstein Tile Composer</h2>
+                    <p class="text-xs text-slate-500">64-bit Kernel Definition</p>
+                </div>
+                
+                <div class="flex-1 overflow-y-auto p-4 space-y-6">
+                    <div class="mb-4">
+                        <div class="flex justify-between text-[10px] text-slate-400 font-mono mb-1"><span>ROW 0 (HALO)</span><span>ROW 7 (PHYS)</span></div>
+                        <div class="tile-grid bg-slate-900 p-2 rounded border border-slate-700" id="visual-bit-grid"></div>
+                    </div>
+
+                    <div class="input-group border-l-4 border-l-emerald-500">
+                        <label class="block text-xs font-bold text-emerald-400 mb-2">PATH B: SEMIOTICS</label>
+                        <div class="space-y-3">
+                            <select id="input-structure" class="w-full bg-slate-800 text-sm border border-slate-600 rounded px-2 py-1.5 focus:border-emerald-500 focus:outline-none">
+                                <option value="A3">0xA3 - Tetrahedral</option>
+                                <option value="BC3" selected>0xB3 - Octahedral</option>
+                                <option value="H3">0xC5 - Icosahedral</option>
+                                <option value="T3">0xD1 - Trefoil Knot</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="input-group border-l-4 border-l-blue-500">
+                        <label class="block text-xs font-bold text-blue-400 mb-2">PATH A: QUATERNION</label>
+                        <div class="space-y-3">
+                            <div class="grid grid-cols-2 gap-2">
+                                <div><label class="text-[10px] text-slate-500">X</label><input type="number" id="quat-x" value="0.5" step="0.1" class="w-full bg-slate-800 text-xs border border-slate-600 rounded px-2 py-1"></div>
+                                <div><label class="text-[10px] text-slate-500">Y</label><input type="number" id="quat-y" value="0.2" step="0.1" class="w-full bg-slate-800 text-xs border border-slate-600 rounded px-2 py-1"></div>
+                                <div><label class="text-[10px] text-slate-500">Z</label><input type="number" id="quat-z" value="0.3" step="0.1" class="w-full bg-slate-800 text-xs border border-slate-600 rounded px-2 py-1"></div>
+                                <div><label class="text-[10px] text-slate-500">W</label><input type="number" id="quat-w" value="1.0" step="0.1" class="w-full bg-slate-800 text-xs border border-slate-600 rounded px-2 py-1"></div>
+                            </div>
+                            <button id="btn-normalize" class="w-full text-xs bg-blue-900/30 hover:bg-blue-900/50 text-blue-300 py-1 rounded border border-blue-800">Normalize</button>
+                        </div>
+                    </div>
+
+                    <div class="input-group border-l-4 border-l-amber-500">
+                        <label class="block text-xs font-bold text-amber-400 mb-2">PATH C: PHYSICS</label>
+                        <div class="space-y-4">
+                            <div><div class="flex justify-between text-xs mb-1"><span class="text-slate-400">Spin</span> <span id="val-spin" class="text-amber-400 font-mono">0.0</span></div><input type="range" id="input-spin" min="0" max="6.28" step="0.1" value="0" class="w-full accent-amber-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"></div>
+                            <div><div class="flex justify-between text-xs mb-1"><span class="text-slate-400">Freq</span> <span id="val-freq" class="text-amber-400 font-mono">1.0</span></div><input type="range" id="input-freq" min="1" max="5" step="0.5" value="1" class="w-full accent-amber-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"></div>
+                            <div><div class="flex justify-between text-xs mb-1"><span class="text-slate-400">Amp</span> <span id="val-amp" class="text-amber-400 font-mono">0.5</span></div><input type="range" id="input-amp" min="0.1" max="2.0" step="0.1" value="0.5" class="w-full accent-amber-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"></div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2 mt-2">
+                        <button id="btn-project" class="bg-gradient-to-r from-sky-600 to-blue-700 hover:from-sky-500 hover:to-blue-600 text-white font-bold py-3 rounded shadow-lg text-xs">INITIATE PROJ.</button>
+                        <button id="btn-cycle" class="bg-gradient-to-r from-purple-600 to-indigo-700 hover:from-purple-500 hover:to-indigo-600 text-white font-bold py-3 rounded shadow-lg text-xs">RUN 720 CYCLE</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Center Column -->
+            <div class="flex-1 flex flex-col gap-4 overflow-hidden">
+                
+                <!-- Manifold View (Top) -->
+                <div class="panel flex-1 flex flex-col relative overflow-hidden">
+                    <div class="absolute top-4 left-4 z-10 bg-slate-900/80 backdrop-blur px-3 py-1.5 rounded border border-slate-700">
+                        <span class="text-xs font-mono text-sky-400">VIEWPORT: CLIFFORD-STRASSEN TOROID</span>
+                    </div>
+                    <div class="absolute top-4 right-4 z-10 flex flex-col items-end gap-2">
+                        <div id="cycle-status" class="hidden bg-purple-900/80 backdrop-blur px-3 py-1.5 rounded border border-purple-500/50 flex items-center gap-2">
+                            <span class="text-xs font-mono text-purple-200">CYCLE: <span id="step-counter">0</span>/720</span>
+                        </div>
+                    </div>
+                    <div id="plot-container" class="w-full h-full bg-slate-900/50"></div>
+                    <div id="loading-overlay" class="hidden absolute inset-0 bg-slate-900/90 flex flex-col items-center justify-center z-50">
+                        <div class="w-16 h-16 border-4 border-sky-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                        <p class="font-mono text-sky-400 animate-pulse">CALCULATING GEODESIC FLOWS...</p>
+                    </div>
+                </div>
+
+                <!-- Codex / Learning Panel (Bottom) -->
+                <div class="panel h-48 flex flex-col overflow-hidden bg-slate-900/80">
+                    <div class="px-4 py-2 border-b border-slate-700 bg-slate-800/80 flex justify-between items-center">
+                        <h2 class="font-bold text-xs text-amber-400 uppercase tracking-wider">Learned Codex (Crystallized Memory)</h2>
+                        <span class="text-[10px] text-slate-500 font-mono">OFFLOADING REPETITIVE CONTEXT</span>
+                    </div>
+                    <div class="flex-1 p-2 overflow-y-auto font-mono text-xs">
+                        <table class="w-full text-left border-collapse">
+                            <thead class="text-slate-500 border-b border-slate-800">
+                                <tr>
+                                    <th class="p-2 font-normal">Hash</th>
+                                    <th class="p-2 font-normal">Structure ID</th>
+                                    <th class="p-2 font-normal">Context Modifiers</th>
+                                    <th class="p-2 font-normal">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="codex-list" class="text-slate-300">
+                                <!-- JS Populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: S-Plane Decoder -->
+            <div class="panel w-72 flex flex-col overflow-hidden flex-shrink-0">
+                <div class="p-4 border-b border-slate-700 bg-slate-800/50 flex justify-between items-center">
+                    <div>
+                        <h2 class="font-bold text-sm text-purple-400 uppercase tracking-wider">S-Plane Decoder</h2>
+                        <p class="text-xs text-slate-500">6-Part Lattice Scan</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-[10px] text-slate-400 font-mono" id="scan-state-text">ACTIVE</span>
+                        <div class="relative inline-block w-8 mr-2 align-middle select-none transition duration-200 ease-in">
+                            <input type="checkbox" name="toggle" id="s-plane-toggle" class="toggle-checkbox absolute block w-4 h-4 rounded-full bg-white border-4 appearance-none cursor-pointer" checked style="top: 2px; left: 2px; transition: all 0.2s;">
+                            <label for="s-plane-toggle" class="toggle-label block overflow-hidden h-5 rounded-full bg-gray-300 cursor-pointer bg-emerald-500"></label>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="decoder-content" class="flex-1 p-4 overflow-y-auto space-y-6 transition-opacity duration-300">
+                    <div class="relative bg-slate-900 border border-slate-700 h-28 rounded flex items-center justify-center overflow-hidden" id="scan-container">
+                        <div class="grid grid-cols-4 gap-1 opacity-30 w-24 h-24 transform rotate-45">
+                            <div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div>
+                            <div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div>
+                            <div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div>
+                            <div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div><div class="bg-slate-500 rounded-sm"></div>
+                        </div>
+                        <div class="absolute w-full top-0 scan-line" id="scan-line"></div>
+                        <div class="absolute bottom-2 right-2 text-xs font-mono text-emerald-500" id="scan-status">SCANNING...</div>
+                    </div>
+
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-slate-400 uppercase">TQF Compression</label>
+                        <div class="bg-slate-900 p-3 rounded border border-slate-700 font-mono text-xs space-y-1">
+                            <div class="flex justify-between"><span class="text-slate-500">Scan Points:</span><span class="text-white">64 Nodes</span></div>
+                            <div class="flex justify-between"><span class="text-slate-500">Collinear Triplets:</span><span class="text-sky-400" id="val-triplets">0</span></div>
+                            <div class="flex justify-between"><span class="text-slate-500">Redundancy:</span><span class="text-red-400" id="val-redundancy">0%</span></div>
+                            <div class="h-px bg-slate-700 my-2"></div>
+                            <div class="flex justify-between font-bold"><span class="text-purple-400">TQF Valid:</span><span class="text-emerald-400">TRUE</span></div>
+                        </div>
+                    </div>
+
+                    <div class="space-y-2 flex-1">
+                        <label class="text-xs font-bold text-slate-400 uppercase">Soliton Stream</label>
+                        <div class="h-32 overflow-y-auto bg-slate-900 rounded border border-slate-700 p-2 space-y-1" id="soliton-list"></div>
+                    </div>
+                </div>
+                
+                <!-- REMOVED OVERLAY HERE -->
+            </div>
+        </div>
+
+        <!-- View: Protocols (Docs) -->
+        <div id="view-protocols" class="hidden w-full h-full bg-slate-800/50 backdrop-blur rounded-lg p-8 overflow-y-auto">
+             <div class="max-w-4xl mx-auto prose prose-invert prose-slate">
+                <h1 class="text-3xl font-bold text-white mb-6">SHD-CCP Decoding Framework</h1>
+                <div class="bg-slate-900 p-6 rounded-lg border border-slate-700 mb-8">
+                    <h3 class="text-sky-400 font-bold mb-2">Stage 4: Crystallization</h3>
+                    <p class="text-sm text-slate-400">The system employs a "Learned Codex" to handle repetitive context.</p>
+                    <ul class="text-sm text-slate-300 list-disc pl-4 mt-2">
+                        <li><strong>Novel Patterns:</strong> Processed fully on the Manifold (Hot Memory). Added to Codex.</li>
+                        <li><strong>Known Patterns:</strong> Detected by hash collision. Replaced by a lightweight Pointer (Structure ID) and served from Cold Storage.</li>
+                    </ul>
+                </div>
+             </div>
+        </div>
+
+        <!-- View: API Bridge -->
+        <div id="view-api" class="hidden w-full h-full flex flex-col items-center justify-center p-8">
+            <div class="panel w-full max-w-3xl h-full flex flex-col p-6">
+                <h2 class="text-xl font-bold text-white mb-2">External LLM Integration Bridge</h2>
+                <div class="flex-1 bg-slate-950 rounded-lg border border-slate-700 p-4 font-mono text-xs text-green-400 overflow-auto relative group">
+                    <pre id="api-payload"></pre>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Logic -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const state = {
+                quaternion: { x: 0.5, y: 0.2, z: 0.3, w: 1.0 },
+                structure: 'BC3',
+                physics: { spin: 0.0, freq: 1.0, amp: 0.5 },
+                s_plane_active: true,
+                codex: new Set(), // Set of known pattern hashes
+            };
+
+            const plotContainer = document.getElementById('plot-container');
+            let cycleInterval;
+            
+            // --- S-Plane Toggle Logic ---
+            const toggle = document.getElementById('s-plane-toggle');
+            toggle.addEventListener('change', (e) => {
+                state.s_plane_active = e.target.checked;
+                // const content = document.getElementById('decoder-content'); // Removed opacity logic
+                // const overlay = document.getElementById('decoder-disabled'); // Removed logic
+                const scanLine = document.getElementById('scan-line');
+                const label = document.querySelector('.toggle-label');
+                const statusText = document.getElementById('scan-status');
+                const activeText = document.getElementById('scan-state-text');
+
+                if (state.s_plane_active) {
+                    scanLine.classList.remove('paused');
+                    label.style.backgroundColor = '#10b981'; // Green
+                    statusText.innerText = "SCANNING...";
+                    statusText.className = "absolute bottom-2 right-2 text-xs font-mono text-emerald-500";
+                    activeText.innerText = "ACTIVE";
+                    activeText.className = "text-[10px] text-slate-400 font-mono";
+                    runScanSimulation();
+                } else {
+                    scanLine.classList.add('paused');
+                    label.style.backgroundColor = '#f59e0b'; // Amber for Paused
+                    statusText.innerText = "PAUSED (OPTIMIZING)";
+                    statusText.className = "absolute bottom-2 right-2 text-xs font-mono text-amber-500 animate-pulse";
+                    activeText.innerText = "PAUSED";
+                    activeText.className = "text-[10px] text-amber-500 font-mono";
+                }
+            });
+
+            function initPlot() {
+                const layout = {
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(0,0,0,0)',
+                    scene: { xaxis: {visible:false}, yaxis: {visible:false}, zaxis: {visible:false}, camera: {eye: {x:1.5, y:1.5, z:1.5}}, aspectmode: 'cube' },
+                    margin: { l: 0, r: 0, b: 0, t: 0 }, showlegend: false
+                };
+                Plotly.newPlot(plotContainer, generateManifoldData(), layout, {responsive: true, displayModeBar: false});
+            }
+
+            function generateManifoldData(step = 0, isCycle = false) {
+                const res = 30; // Reduced from 40 for performance
+                const x = [], y = [], z = [], x2 = [], y2 = [], z2 = [];
+                const twist = state.physics.spin, freq = state.physics.freq, amp = state.physics.amp;
+                let R = 3, r = 1;
+                
+                // Base Manifold Calculation (Simplified loop)
+                for (let i = 0; i <= res; i++) {
+                    const rowX=[], rowY=[], rowZ=[], rowX2=[], rowY2=[], rowZ2=[];
+                    const theta = (i/res)*2*Math.PI;
+                    for (let j = 0; j <= res; j++) {
+                        const phi = (j/res)*2*Math.PI;
+                        let X = (R + r * Math.cos(freq * theta + twist)) * Math.cos(phi);
+                        let Y = (R + r * Math.cos(freq * theta + twist)) * Math.sin(phi);
+                        let Z = r * Math.sin(freq * theta) * amp * 2;
+                        
+                        // Quat Rotation
+                        const q = state.quaternion;
+                        const norm = Math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+                        const nq = {x:q.x/norm, y:q.y/norm, z:q.z/norm, w:q.w/norm};
+                        
+                        const ix = nq.w * X + nq.y * Z - nq.z * Y;
+                        const iy = nq.w * Y + nq.z * X - nq.x * Z;
+                        const iz = nq.w * Z + nq.x * Y - nq.y * X;
+                        const iw = -nq.x * X - nq.y * Y - nq.z * Z;
+
+                        X = ix * nq.w + iw * -nq.x + iy * -nq.z - iz * -nq.y;
+                        Y = iy * nq.w + iw * -nq.y + iz * -nq.x - ix * -nq.z;
+                        Z = iz * nq.w + iw * -nq.z + ix * -nq.y - iy * -nq.x;
+
+                        rowX.push(X); rowY.push(Y); rowZ.push(Z);
+                        rowX2.push(X*0.8); rowY2.push(Y*0.8); rowZ2.push(Z*0.8);
+                    }
+                    x.push(rowX); y.push(rowY); z.push(rowZ);
+                    x2.push(rowX2); y2.push(rowY2); z2.push(rowZ2);
+                }
+
+                const data = [
+                    { type: 'surface', x:x, y:y, z:z, colorscale: 'Viridis', opacity: 0.6, showscale: false },
+                    { type: 'surface', x:x2, y:y2, z:z2, colorscale: 'Electric', opacity: 0.2, showscale: false } // Lower opacity
+                ];
+
+                if (isCycle) {
+                    const numStreams = 12;
+                    const streamsX=[], streamsY=[], streamsZ=[];
+                    const knotX=[], knotY=[], knotZ=[];
+                    const markerColor=[];
+                    const progress = step / 720; 
+                    
+                    // Optimized Stream Logic
+                    for(let s = 0; s < numStreams; s++) {
+                        const phase = (s / numStreams) * 2 * Math.PI;
+                        const theta = progress * 4 * Math.PI + phase;
+                        const phi = progress * 6 * Math.PI;
+                        
+                        let X = (R + r * Math.cos(freq * theta + twist)) * Math.cos(phi);
+                        let Y = (R + r * Math.cos(freq * theta + twist)) * Math.sin(phi);
+                        let Z = r * Math.sin(freq * theta) * amp * 2;
+                        
+                        // Quat Rot (Inline for perf)
+                        const q = state.quaternion;
+                        const norm = Math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+                        const nq = {x:q.x/norm, y:q.y/norm, z:q.z/norm, w:q.w/norm};
+                        
+                        const ix = nq.w * X + nq.y * Z - nq.z * Y;
+                        const iy = nq.w * Y + nq.z * X - nq.x * Z;
+                        const iz = nq.w * Z + nq.x * Y - nq.y * X;
+                        const iw = -nq.x * X - nq.y * Y - nq.z * Z;
+
+                        X = ix * nq.w + iw * -nq.x + iy * -nq.z - iz * -nq.y;
+                        Y = iy * nq.w + iw * -nq.y + iz * -nq.x - ix * -nq.z;
+                        Z = iz * nq.w + iw * -nq.z + ix * -nq.y - iy * -nq.x;
+
+                        streamsX.push(X); streamsY.push(Y); streamsZ.push(Z);
+                    }
+                    
+                    // Optimized Knot Logic: Use pre-calc points for "nodes"
+                    const compressionEvents = Math.floor(step / 8);
+                    for(let k = 0; k < compressionEvents; k++) {
+                        // Position logic similar to stream
+                        const eventProgress = (k * 8) / 720;
+                        const theta = eventProgress * 4 * Math.PI;
+                        const phi = eventProgress * 6 * Math.PI;
+                        let cX = (R + r * Math.cos(freq * theta)) * Math.cos(phi);
+                        let cY = (R + r * Math.cos(freq * theta)) * Math.sin(phi);
+                        let cZ = r * Math.sin(freq * theta) * amp * 2;
+                        
+                        const q = state.quaternion;
+                        const norm = Math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+                        const nq = {x:q.x/norm, y:q.y/norm, z:q.z/norm, w:q.w/norm};
+                        
+                        const ix = nq.w * cX + nq.y * cZ - nq.z * cY;
+                        const iy = nq.w * cY + nq.z * cX - nq.x * cZ;
+                        const iz = nq.w * cZ + nq.x * cY - nq.y * cX;
+                        const iw = -nq.x * cX - nq.y * cY - nq.z * cZ;
+                        cX = ix * nq.w + iw * -nq.x + iy * -nq.z - iz * -nq.y;
+                        cY = iy * nq.w + iw * -nq.y + iz * -nq.x - ix * -nq.z;
+                        cZ = iz * nq.w + iw * -nq.z + ix * -nq.y - iy * -nq.x;
+
+                        knotX.push(cX); knotY.push(cY); knotZ.push(cZ);
+                        
+                        if (k < 22) markerColor.push('#ef4444');
+                        else if (k < 45) markerColor.push('#eab308');
+                        else if (k < 67) markerColor.push('#10b981');
+                        else markerColor.push('#3b82f6');
+                    }
+
+                    data.push({ type: 'scatter3d', mode: 'markers', x: streamsX, y: streamsY, z: streamsZ, marker: { size: 4, color: '#ffffff', opacity: 0.9 }, name: 'Data Streams' });
+                    data.push({ type: 'scatter3d', mode: 'markers', x: knotX, y: knotY, z: knotZ, marker: { size: 5, color: markerColor, symbol: 'circle-open' }, name: 'Nodes' });
+                }
+                return data;
+            }
+
+            // Sim logic
+            function runScanSimulation() {
+                if (!state.s_plane_active) return;
+                const redundancy = Math.floor(Math.random() * 30) + 20;
+                const triplets = Math.floor(Math.random() * 12) + 4;
+                document.getElementById('val-triplets').innerText = triplets;
+                document.getElementById('val-redundancy').innerText = redundancy + '%';
+                
+                // Crystallization Check
+                // Generate a pseudo-hash based on current params
+                const hashInput = `${state.structure}-${state.physics.spin.toFixed(1)}-${state.physics.freq}`;
+                // Simple hash code
+                let hash = 0; for(let i=0;i<hashInput.length;i++) hash = Math.imul(31, hash) + hashInput.charCodeAt(i) | 0;
+                const hexHash = '0x' + Math.abs(hash).toString(16).toUpperCase();
+                
+                let isKnown = state.codex.has(hexHash);
+                if (!isKnown && Math.random() > 0.7) { // 30% chance to "learn" a new pattern
+                    state.codex.add(hexHash);
+                    addCodexEntry(hexHash, state.structure, "Novel Topology Detected");
+                    isKnown = false; // Just learned
+                } else if (isKnown) {
+                    // Update UI to show it's cached/referenced
+                }
+
+                const list = document.getElementById('soliton-list');
+                list.innerHTML = '';
+                
+                if (isKnown) {
+                     list.innerHTML = `<div class="p-2 bg-emerald-900/30 border border-emerald-700 rounded text-center">
+                        <div class="text-xs text-emerald-400 font-bold">PATTERN CRYSTALLIZED</div>
+                        <div class="text-[10px] text-emerald-600 mt-1">Loaded from Codex: ${hexHash}</div>
+                     </div>`;
+                } else {
+                    for(let i=1; i<=9; i++) {
+                        const coord = `[${(Math.random()*2-1).toFixed(2)}, ${(Math.random()*2-1).toFixed(2)}, ${(Math.random()*2-1).toFixed(2)}]`;
+                        list.innerHTML += `<div class="text-[10px] font-mono text-slate-400 border-b border-slate-800 pb-1"><span class="text-sky-500">SOL-${i.toString().padStart(2,'0')}:</span> ${coord} <span class="text-emerald-500">LOCKED</span></div>`;
+                    }
+                }
+            }
+            
+            function addCodexEntry(hash, structure, context) {
+                const tbody = document.getElementById('codex-list');
+                const row = document.createElement('tr');
+                row.className = 'codex-item border-b border-slate-800 hover:bg-slate-800/50';
+                row.innerHTML = `
+                    <td class="p-2 font-mono text-emerald-400">${hash}</td>
+                    <td class="p-2">${structure}</td>
+                    <td class="p-2 text-slate-400">${context}</td>
+                    <td class="p-2"><span class="bg-sky-900 text-sky-300 px-1 rounded text-[10px]">CACHED</span></td>
+                `;
+                tbody.prepend(row);
+                // Keep list short
+                if(tbody.children.length > 5) tbody.lastElementChild.remove();
+            }
+            
+            // ... (Rest of input handling same as previous, simplified for brevity) ...
+             function updateState() {
+                state.quaternion.x = parseFloat(document.getElementById('quat-x').value);
+                state.quaternion.y = parseFloat(document.getElementById('quat-y').value);
+                state.quaternion.z = parseFloat(document.getElementById('quat-z').value);
+                state.quaternion.w = parseFloat(document.getElementById('quat-w').value);
+                state.physics.spin = parseFloat(document.getElementById('input-spin').value);
+                state.physics.freq = parseFloat(document.getElementById('input-freq').value);
+                state.physics.amp = parseFloat(document.getElementById('input-amp').value);
+                state.structure = document.getElementById('input-structure').value;
+                document.getElementById('val-spin').innerText = state.physics.spin.toFixed(1);
+                document.getElementById('val-freq').innerText = state.physics.freq.toFixed(1);
+                document.getElementById('val-amp').innerText = state.physics.amp.toFixed(1);
+                updateAPIJSON();
+            }
+
+            function updateAPIJSON() {
+                const payload = {
+                    protocol: "SHD-CCP-v1.0",
+                    einstein_tile: { id: state.structure, quat: state.quaternion, phys: state.physics },
+                    status: state.s_plane_active ? "SCANNING" : "OPTIMIZED_CYCLE"
+                };
+                document.getElementById('api-payload').innerText = JSON.stringify(payload, null, 2);
+            }
+
+            function projectManifold() {
+                document.getElementById('loading-overlay').classList.remove('hidden');
+                setTimeout(() => {
+                    document.getElementById('loading-overlay').classList.add('hidden');
+                    Plotly.react(plotContainer, generateManifoldData(), { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', scene: { xaxis: {visible:false}, yaxis: {visible:false}, zaxis: {visible:false} }, showlegend: false });
+                    renderBitGrid();
+                }, 600);
+            }
+
+            document.getElementById('btn-cycle').addEventListener('click', () => {
+                let step = 0;
+                document.getElementById('cycle-status').classList.remove('hidden');
+                
+                // Auto-disable S-Plane for performance
+                toggle.checked = false;
+                toggle.dispatchEvent(new Event('change'));
+
+                if(cycleInterval) clearInterval(cycleInterval);
+                cycleInterval = setInterval(() => {
+                    if(step > 720) { clearInterval(cycleInterval); return; }
+                    document.getElementById('step-counter').innerText = step;
+                    Plotly.react(plotContainer, generateManifoldData(step, true), { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', scene: { xaxis: {visible:false}, yaxis: {visible:false}, zaxis: {visible:false}, camera: {eye: {x:1.5, y:1.5, z:1.5}} }, showlegend: false });
+                    step += 12; // Speed up cycle
+                }, 50);
+            });
+
+            // Init
+            function renderBitGrid() {
+                 const grid = document.getElementById('visual-bit-grid'); grid.innerHTML = '';
+                 for (let r=0; r<8; r++) for (let c=0; c<8; c++) {
+                     const bit = document.createElement('div'); bit.className = 'tile-bit';
+                     if(r===0) bit.classList.add('halo'); else if(r===7) bit.classList.add('phys'); else if(r>=2&&r<=5) bit.classList.add('core');
+                     if(Math.random()>0.5) bit.classList.add('active');
+                     grid.appendChild(bit);
+                 }
+            }
+            ['quat-x','quat-y','quat-z','quat-w','input-structure','input-spin','input-freq','input-amp'].forEach(id => document.getElementById(id).addEventListener('input', updateState));
+            document.getElementById('btn-project').addEventListener('click', projectManifold);
+            document.getElementById('btn-normalize').addEventListener('click', () => {
+                 const q = state.quaternion; const l = Math.sqrt(q.x**2+q.y**2+q.z**2+q.w**2);
+                 if(l) { document.getElementById('quat-x').value=(q.x/l).toFixed(3); updateState(); }
+            });
+            const views={'tab-console':'view-console','tab-protocols':'view-protocols','tab-api':'view-api'};
+            Object.keys(views).forEach(k => document.getElementById(k).addEventListener('click', () => {
+                 document.querySelectorAll('.tab-button').forEach(b=>b.classList.remove('active')); document.getElementById(k).classList.add('active');
+                 Object.values(views).forEach(v=>document.getElementById(v).classList.add('hidden')); document.getElementById(views[k]).classList.remove('hidden');
+                 if(k==='tab-console') Plotly.relayout(plotContainer, {autosize:true});
+            }));
+
+            initPlot(); renderBitGrid(); updateState(); runScanSimulation();
+            setInterval(() => { if(state.s_plane_active) runScanSimulation(); }, 5000);
+        });
+        function copyToClipboard() { navigator.clipboard.writeText(document.getElementById('api-payload').innerText); alert("Copied!"); }
+    </script>
+</body>
+</html>
